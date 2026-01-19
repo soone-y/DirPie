@@ -25,6 +25,53 @@
 
 ---
 
+## ダウンロード / 実行方法
+
+### 実行ファイルを使う場合（推奨）
+本プロジェクトの配布用実行ファイルは **GitHub Releases** にあります。
+
+- Releases ページから `DirPie.exe` をダウンロードしてください
+- 対応環境: Windows 10 / 11（x64）
+- 本ソフトは **ファイル内容の読み取り・変更・削除を行いません**
+  （取得するのはファイルサイズとパス情報のみです）
+
+※ リポジトリ直下には実行ファイルは置いていません。
+
+---
+
+### ソースコードからビルドする場合
+
+- ソースコード: `src/DirPie4.cpp`
+- ビルド補助スクリプト: `scripts/build.ps1`（PowerShell 用）
+
+本プロジェクトは C++ による Windows ネイティブアプリケーションです。
+Visual Studio（MSVC）または MinGW-w64 + Windows SDK を使用してビルドできます。
+
+---
+
+## ディレクトリ構成
+
+/
+├─ src/ ソースコード
+├─ scripts/ ビルド用スクリプト
+├─ README.md
+├─ README_en.md
+└─ LICENSE.md
+
+配布用の `.exe` は GitHub Releases にのみ配置します。
+
+---
+## ファイルの検証（任意）
+
+配布されている `DirPie.exe` について、改変されていないことを確認するため、
+SHA-256 ハッシュ値を公開しています。
+
+### 確認方法（PowerShell）
+```powershell
+Get-FileHash DirPie.exe -Algorithm SHA256
+
+---
+
 ## 使い方（考え方）
 
 1. 対象ディレクトリを選択
