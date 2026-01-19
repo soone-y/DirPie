@@ -1,0 +1,2 @@
+g++ -O2 -std=c++17 -municode DirPie4.cpp -o DirPie4.exe -mwindows -lcomctl32 -lole32 -luxtheme -lgdi32 -lgd
+iplus -luser32 -lshell32 -luuid
