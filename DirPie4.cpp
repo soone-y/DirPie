@@ -43,6 +43,64 @@ static HWND g_hwndEdit = nullptr;
 static HWND g_hwndUp = nullptr;
 static HWND g_hwndStatus = nullptr;
 
+static const int IDM_OPEN_FOLDER = 2001;
+static const int IDM_NEW_WINDOW_BLANK = 2002;
+static const int IDM_NEW_WINDOW_PICK = 2003;
+static const int IDM_EXIT_APP = 2004;
+
+static std::wstring PickFolder(HWND owner) {
+  std::wstring out;
+  IFileDialog* pfd = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd));
+  if (FAILED(hr) || !pfd) return out;
+
+  DWORD opts = 0;
+  if (SUCCEEDED(pfd->GetOptions(&opts))) {
+    pfd->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+  }
+  pfd->SetTitle(L"Select Folder");
+
+  hr = pfd->Show(owner);
+  if (SUCCEEDED(hr)) {
+    IShellItem* psi = nullptr;
+    if (SUCCEEDED(pfd->GetResult(&psi)) && psi) {
+      PWSTR psz = nullptr;
+      if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &psz)) && psz) {
+        out = psz;
+        CoTaskMemFree(psz);
+      }
+      psi->Release();
+    }
+  }
+  pfd->Release();
+  return out;
+}
+
+static void LaunchNewInstance(const std::wstring& folderOrEmpty) {
+  wchar_t exePath[MAX_PATH]{};
+  GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+  std::wstring cmd = L"\"";
+  cmd += exePath;
+  cmd += L"\"";
+  if (!folderOrEmpty.empty()) {
+    cmd += L" \"";
+    cmd += folderOrEmpty;
+    cmd += L"\"";
+  }
+
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  std::wstring cmdMutable = cmd;
+  if (CreateProcessW(nullptr, cmdMutable.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return;
+  }
+  ShellExecuteW(nullptr, L"open", exePath, folderOrEmpty.empty() ? nullptr : folderOrEmpty.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
 static ULONG_PTR g_gdiplusToken = 0;
 
 static std::atomic<uint64_t> g_generation{1};
@@ -86,6 +144,17 @@ static std::vector<Entry> g_entries;
 static wstring g_currentDir = L"C:\\";
 static int g_hoverIndex = -1;
 
+static std::atomic<uint32_t> g_jobs_total{0};
+static std::atomic<uint32_t> g_jobs_done{0};
+static std::atomic<uint32_t> g_jobs_active{0};
+static std::atomic<uint32_t> g_jobs_queued{0};
+static std::atomic<uint32_t> g_jobs_exact_total{0};
+static std::atomic<uint32_t> g_jobs_exact_done{0};
+
+// Progress is tracked per "epoch" to avoid counter corruption when a new scan starts
+// while worker threads are still finishing old jobs.
+static std::atomic<uint64_t> g_progressEpoch{1};
+
 static uint64_t NowTick() { return GetTickCount64(); }
 
 static bool IsDots(const wchar_t* n) {
@@ -108,13 +177,11 @@ static bool StartsWithNoCase(const wstring& s, const wchar_t* pref) {
 }
 
 static wstring ToLongPath(const wstring& p_in) {
-
   wstring p = p_in;
   if (p.empty()) return p;
   if (StartsWithNoCase(p, L"\\\\?\\")) return p;
   if (StartsWithNoCase(p, L"\\\\.\\")) return p;
   if (StartsWithNoCase(p, L"\\\\")) {
-
     return L"\\\\?\\UNC\\" + p.substr(2);
   }
   return L"\\\\?\\" + p;
@@ -235,6 +302,7 @@ enum class JobKind { Capped, Exact };
 
 struct Job {
   uint64_t gen = 0;
+  uint64_t epoch = 0;
   wstring path;
   JobKind kind = JobKind::Capped;
 };
@@ -247,7 +315,23 @@ static bool IsFresh(const SizeInfo& si) {
   return (NowTick() - si.tick) < REFRESH_INTERVAL_MS;
 }
 
+static void ResetProgressCounters() {
+  g_jobs_total.store(0);
+  g_jobs_done.store(0);
+  g_jobs_active.store(0);
+  g_jobs_queued.store(0);
+  g_jobs_exact_total.store(0);
+  g_jobs_exact_done.store(0);
+}
+
 static void EnqueueJob(const Job& j) {
+  // Only count jobs belonging to the current epoch.
+  if (j.epoch == g_progressEpoch.load()) {
+    g_jobs_total.fetch_add(1);
+    if (j.kind == JobKind::Exact) g_jobs_exact_total.fetch_add(1);
+    g_jobs_queued.fetch_add(1);
+  }
+
   { std::lock_guard<std::mutex> lk(g_jobMu); g_jobs.push_back(j); }
   g_jobCv.notify_one();
 }
@@ -255,6 +339,27 @@ static void EnqueueJob(const Job& j) {
 static void ClearJobs() {
   std::lock_guard<std::mutex> lk(g_jobMu);
   g_jobs.clear();
+}
+
+static void UpdateWindowTitleProgress() {
+  if (!g_hwndMain) return;
+
+  const uint32_t total = g_jobs_total.load();
+  const uint32_t done = g_jobs_done.load();
+  const uint32_t active = g_jobs_active.load();
+  const uint32_t queued = g_jobs_queued.load();
+
+  const uint32_t doneClamped = (total > 0 && done > total) ? total : done;
+
+  bool scanning = (active + queued) > 0 && total > 0 && doneClamped < total;
+
+  wchar_t title[256];
+  if (scanning) {
+    swprintf(title, 256, L"DirPie4  (Scanning %u/%u)", doneClamped, total);
+  } else {
+    swprintf(title, 256, L"DirPie4");
+  }
+  SetWindowTextW(g_hwndMain, title);
 }
 
 static void WorkerThreadMain() {
@@ -268,12 +373,34 @@ static void WorkerThreadMain() {
       g_jobs.pop_front();
     }
 
-    if (g_generation.load() != job.gen) continue;
+    const uint64_t curEpoch = g_progressEpoch.load();
+    const bool track = (job.epoch == curEpoch);
+    if (track) {
+      g_jobs_queued.fetch_sub(1);
+      g_jobs_active.fetch_add(1);
+    }
+
+    if (g_generation.load() != job.gen) {
+      if (track) {
+        g_jobs_active.fetch_sub(1);
+        g_jobs_done.fetch_add(1);
+      }
+      PostMessageW(g_hwndMain, WM_APP_REFRESH, (WPARAM)job.gen, 0);
+      continue;
+    }
 
     WalkStats st{};
     const uint64_t cap = (job.kind == JobKind::Capped) ? CAP_BYTES : 0;
     const uint64_t bytes = WalkDirLogicalSize(job.path, cap, job.gen, st);
-    if (g_generation.load() != job.gen) continue;
+
+    if (g_generation.load() != job.gen) {
+      if (track) {
+        g_jobs_active.fetch_sub(1);
+        g_jobs_done.fetch_add(1);
+      }
+      PostMessageW(g_hwndMain, WM_APP_REFRESH, (WPARAM)job.gen, 0);
+      continue;
+    }
 
     SizeInfo si{};
     si.bytes = bytes;
@@ -287,10 +414,8 @@ static void WorkerThreadMain() {
       auto it = g_cache.find(job.path);
       if (it != g_cache.end()) {
         const SizeInfo& old = it->second;
-
         if (old.exact && !old.incomplete) {
           if (si.incomplete && !si.exact) {
-
           } else {
             g_cache[job.path] = si;
           }
@@ -302,10 +427,16 @@ static void WorkerThreadMain() {
       }
     }
 
+    if (track) {
+      g_jobs_active.fetch_sub(1);
+      g_jobs_done.fetch_add(1);
+      if (job.kind == JobKind::Exact) g_jobs_exact_done.fetch_add(1);
+    }
+
     PostMessageW(g_hwndMain, WM_APP_REFRESH, (WPARAM)job.gen, 0);
 
     if (job.kind == JobKind::Capped) {
-      if (st.reached_cap || st.incomplete) EnqueueJob(Job{job.gen, job.path, JobKind::Exact});
+      if (st.reached_cap || st.incomplete) EnqueueJob(Job{job.gen, job.epoch, job.path, JobKind::Exact});
     }
   }
 }
@@ -318,7 +449,7 @@ static void EnsureListColumns(HWND lv) {
   col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
   col.pszText = (LPWSTR)L"Name"; col.cx = 260; col.iSubItem = 0; ListView_InsertColumn(lv, 0, &col);
-  col.pszText = (LPWSTR)L"Size"; col.cx = 140; col.iSubItem = 1; ListView_InsertColumn(lv, 1, &col);
+  col.pszText = (LPWSTR)L"Size"; col.cx = 170; col.iSubItem = 1; ListView_InsertColumn(lv, 1, &col);
   col.pszText = (LPWSTR)L"%";    col.cx =  70; col.iSubItem = 2; ListView_InsertColumn(lv, 2, &col);
 }
 
@@ -327,9 +458,14 @@ static void RefreshUIFromCache(uint64_t gen) {
 
   uint64_t sum = 0;
   WalkStats totals{};
+  int totalEntries = 0;
+  int knownEntries = 0;
+  int exactEntries = 0;
+  int incompleteEntries = 0;
 
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    totalEntries = (int)g_entries.size();
     for (auto& e : g_entries) {
       auto it = g_cache.find(e.path);
       if (it != g_cache.end()) {
@@ -341,7 +477,14 @@ static void RefreshUIFromCache(uint64_t gen) {
         e.stats = si.stats;
       }
 
-      if (e.has_value) sum += e.bytes;
+      if (e.has_value) {
+        sum += e.bytes;
+        knownEntries++;
+        if (e.exact && !e.incomplete) exactEntries++;
+        if (e.incomplete || !e.exact) incompleteEntries++;
+      } else {
+        incompleteEntries++;
+      }
 
       totals.skipped_access += e.stats.skipped_access;
       totals.skipped_path   += e.stats.skipped_path;
@@ -376,16 +519,18 @@ static void RefreshUIFromCache(uint64_t gen) {
     const Entry& e = g_entries[i];
     wstring sSize, sPct;
 
-    if (e.has_value) {
-      sSize = (e.incomplete ? L"~ " : L"") + FormatBytes(e.bytes);
+    if (!e.has_value) {
+      sSize = L"...";
+    } else {
+      bool approx = (!e.exact) || e.incomplete;
+      sSize = (approx ? L"~ " : L"") + FormatBytes(e.bytes);
+      if (e.incomplete) sSize += L"  +";
       if (sum > 0) {
         const double pct = (double)e.bytes * 100.0 / (double)sum;
         wchar_t buf[32];
         swprintf(buf, 32, L"%.1f", pct);
         sPct = buf;
       }
-    } else {
-      sSize = L"...";
     }
 
     ListView_SetItemText(g_hwndList, i, 1, (LPWSTR)sSize.c_str());
@@ -394,13 +539,35 @@ static void RefreshUIFromCache(uint64_t gen) {
 
   SendMessageW(g_hwndList, WM_SETREDRAW, TRUE, 0);
 
-  wchar_t sbuf[256];
-  swprintf(sbuf, 256,
-           L"%s  |  skipped: access=%u path=%u other=%u reparse=%u%s",
-           g_currentDir.c_str(),
-           totals.skipped_access, totals.skipped_path, totals.skipped_other, totals.skipped_reparse,
-           totals.incomplete ? L"  (incomplete)" : L"");
+  const uint32_t totalJobs = g_jobs_total.load();
+  const uint32_t doneJobs = g_jobs_done.load();
+  const uint32_t activeJobs = g_jobs_active.load();
+  const uint32_t queuedJobs = g_jobs_queued.load();
+
+  const uint32_t doneJobsClamped = (totalJobs > 0 && doneJobs > totalJobs) ? totalJobs : doneJobs;
+  const uint32_t exactTotal = g_jobs_exact_total.load();
+  const uint32_t exactDone = g_jobs_exact_done.load();
+  const uint32_t exactDoneClamped = (exactTotal > 0 && exactDone > exactTotal) ? exactTotal : exactDone;
+
+  wchar_t sbuf[512];
+  if (activeJobs + queuedJobs > 0 && totalJobs > 0) {
+    swprintf(sbuf, 512,
+             L"%s  |  scanning %u/%u (active=%u queued=%u exact=%u/%u)  |  known %d/%d  |  skipped access=%u path=%u other=%u reparse=%u%s",
+             g_currentDir.c_str(),
+             doneJobsClamped, totalJobs, activeJobs, queuedJobs, exactDoneClamped, exactTotal,
+             knownEntries, totalEntries,
+             totals.skipped_access, totals.skipped_path, totals.skipped_other, totals.skipped_reparse,
+             totals.incomplete ? L"  (incomplete)" : L"");
+  } else {
+    swprintf(sbuf, 512,
+             L"%s  |  done  |  known %d/%d  |  skipped access=%u path=%u other=%u reparse=%u%s",
+             g_currentDir.c_str(),
+             knownEntries, totalEntries,
+             totals.skipped_access, totals.skipped_path, totals.skipped_other, totals.skipped_reparse,
+             totals.incomplete ? L"  (incomplete)" : L"");
+  }
   SetStatusText(sbuf);
+  UpdateWindowTitleProgress();
 
   InvalidateRect(g_hwndPie, nullptr, FALSE);
 }
@@ -501,13 +668,18 @@ static void PiePaint(HWND hwnd, HDC hdc) {
   std::vector<uint64_t> bs;
   uint64_t sum = 0;
   bool allKnown = true;
-  bool anyIncomplete = false;
+  bool anyApprox = false;
+
+  int totalEntries = 0;
+  int knownEntries = 0;
 
   for (auto& e : g_entries) {
+    totalEntries++;
     if (!e.has_value) { allKnown = false; break; }
+    knownEntries++;
     bs.push_back(e.bytes);
     sum += e.bytes;
-    anyIncomplete = anyIncomplete || e.incomplete;
+    anyApprox = anyApprox || (!e.exact) || e.incomplete;
   }
 
   if (!allKnown || sum == 0) {
@@ -537,10 +709,25 @@ static void PiePaint(HWND hwnd, HDC hdc) {
   sf.SetAlignment(Gdiplus::StringAlignmentCenter);
   sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
 
-  const wstring center =
-      (allKnown && sum > 0)
-          ? ((anyIncomplete ? L"~ " : L"") + FormatBytes(sum))
-          : L"Scanning...";
+  wstring center;
+  const uint32_t totalJobs = g_jobs_total.load();
+  const uint32_t doneJobs = g_jobs_done.load();
+  const uint32_t activeJobs = g_jobs_active.load();
+  const uint32_t queuedJobs = g_jobs_queued.load();
+
+  const uint32_t doneJobsClamped = (totalJobs > 0 && doneJobs > totalJobs) ? totalJobs : doneJobs;
+
+  if (activeJobs + queuedJobs > 0 && totalJobs > 0) {
+    wchar_t buf[96];
+    swprintf(buf, 96, L"Scanning %u/%u", doneJobsClamped, totalJobs);
+    center = buf;
+  } else if (allKnown && sum > 0) {
+    center = (anyApprox ? L"~ " : L"") + FormatBytes(sum);
+  } else {
+    wchar_t buf[96];
+    swprintf(buf, 96, L"Scanning %d/%d", knownEntries, totalEntries);
+    center = buf;
+  }
 
   g.DrawString(center.c_str(), -1, &f, rcf, &sf, &txt);
 
@@ -572,7 +759,7 @@ static void SetListHover(int idx) {
   }
 }
 
-static void EnumerateChildrenAndSchedule(uint64_t gen, const wstring& dirAbs) {
+static void EnumerateChildrenAndSchedule(uint64_t gen, uint64_t epoch, const wstring& dirAbs) {
   std::vector<Entry> found;
 
   const wstring dir = TrimTrailingSlash(dirAbs);
@@ -596,25 +783,15 @@ static void EnumerateChildrenAndSchedule(uint64_t gen, const wstring& dirAbs) {
   for (;;) {
     if (g_generation.load() != gen) { FindClose(h); return; }
 
-if (!IsDots(fdat.cFileName)) {
-  const bool isDir = (fdat.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-  Entry e{};
-  e.name = fdat.cFileName;
-  e.path = JoinPath(dir, e.name);
-
-  if (isDir) {
-    found.push_back(std::move(e));
-  } else {
-    const uint64_t sz = ((uint64_t)fdat.nFileSizeHigh << 32) | (uint64_t)fdat.nFileSizeLow;
-    e.bytes = sz;
-    e.has_value = true;
-    e.exact = true;
-    e.incomplete = false;
-    found.push_back(std::move(e));
-  }
-}
-
+    if (!IsDots(fdat.cFileName)) {
+      const bool isDir = (fdat.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      if (isDir) {
+        Entry e{};
+        e.name = fdat.cFileName;
+        e.path = JoinPath(dir, e.name);
+        found.push_back(std::move(e));
+      }
+    }
 
     if (!FindNextFileW(h, &fdat)) break;
   }
@@ -622,29 +799,25 @@ if (!IsDots(fdat.cFileName)) {
 
   { std::lock_guard<std::mutex> lk(g_mu); g_entries = std::move(found); }
 
-for (auto& e : g_entries) {
-  DWORD attr = GetFileAttributesW(ToLongPath(e.path).c_str());
-  if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-    continue; // file: already has exact size
+  for (auto& e : g_entries) {
+    bool need = true;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      auto it = g_cache.find(e.path);
+      if (it != g_cache.end() && IsFresh(it->second)) need = false;
+    }
+    if (need) EnqueueJob(Job{gen, epoch, e.path, JobKind::Capped});
   }
-
-  bool need = true;
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_cache.find(e.path);
-    if (it != g_cache.end() && IsFresh(it->second)) need = false;
-  }
-  if (need) EnqueueJob(Job{gen, e.path, JobKind::Capped});
-}
-
 
   PostMessageW(g_hwndMain, WM_APP_REFRESH, (WPARAM)gen, 0);
 }
 
 static void StartAnalyze(const wstring& dirAbs) {
   const uint64_t gen = g_generation.fetch_add(1) + 1;
+  const uint64_t epoch = g_progressEpoch.fetch_add(1) + 1;
 
   ClearJobs();
+  ResetProgressCounters();
   SetListHover(-1);
 
   g_currentDir = TrimTrailingSlash(dirAbs);
@@ -656,7 +829,8 @@ static void StartAnalyze(const wstring& dirAbs) {
   ListView_DeleteAllItems(g_hwndList);
   InvalidateRect(g_hwndPie, nullptr, TRUE);
 
-  EnumerateChildrenAndSchedule(gen, g_currentDir);
+  UpdateWindowTitleProgress();
+  EnumerateChildrenAndSchedule(gen, epoch, g_currentDir);
 }
 
 static void Layout(HWND hwnd) {
@@ -726,6 +900,17 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_CREATE: {
       InitCommonControls();
 
+      HMENU hMenuBar = CreateMenu();
+      HMENU hFile = CreatePopupMenu();
+      AppendMenuW(hFile, MF_STRING, IDM_OPEN_FOLDER, L"&Open Folder...\tCtrl+O");
+      AppendMenuW(hFile, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(hFile, MF_STRING, IDM_NEW_WINDOW_BLANK, L"&New Window\tCtrl+N");
+      AppendMenuW(hFile, MF_STRING, IDM_NEW_WINDOW_PICK, L"New Window From Folder...");
+      AppendMenuW(hFile, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(hFile, MF_STRING, IDM_EXIT_APP, L"E&xit");
+      AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hFile, L"&File");
+      SetMenu(hwnd, hMenuBar);
+
       g_hwndUp = CreateWindowExW(0, L"BUTTON", L"Up",
                                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                 0, 0, 0, 0,
@@ -772,6 +957,25 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
       if (id == 1001) { StartAnalyze(ParentDir(g_currentDir)); return 0; }
+
+      if (id == IDM_OPEN_FOLDER) {
+        std::wstring p = PickFolder(hwnd);
+        if (!p.empty()) StartAnalyze(p);
+        return 0;
+      }
+      if (id == IDM_NEW_WINDOW_BLANK) {
+        LaunchNewInstance(L"C:\\");
+        return 0;
+      }
+      if (id == IDM_NEW_WINDOW_PICK) {
+        std::wstring p = PickFolder(hwnd);
+        if (!p.empty()) LaunchNewInstance(p);
+        return 0;
+      }
+      if (id == IDM_EXIT_APP) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
       return 0;
     }
 
@@ -797,13 +1001,38 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+int APIENTRY wWinMain(
+    HINSTANCE hInst,
+    HINSTANCE,
+    LPWSTR lpCmdLine,
+    int
+){
   g_hInst = hInst;
 
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
   Gdiplus::GdiplusStartupInput gdiSI;
   Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiSI, nullptr);
+
+  if (lpCmdLine && lpCmdLine[0]) {
+    std::wstring p = lpCmdLine;
+    while (!p.empty() && (p.front() == L' ' || p.front() == L'\t')) p.erase(p.begin());
+    if (!p.empty() && p.front() == L'"') {
+      size_t q = p.find(L'"', 1);
+      if (q != std::wstring::npos) p = p.substr(1, q - 1);
+    }
+    if (!p.empty()) g_currentDir = p;
+  }
+
+  // Default startup directory: the folder containing this executable.
+  // (Scanning C:\ at startup can be heavy.)
+  if (g_currentDir == L"C:\\") {
+    wchar_t mod[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, mod, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+      g_currentDir = ParentDir(mod);
+    }
+  }
 
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
@@ -833,11 +1062,23 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
   workers.reserve(WORKER_COUNT);
   for (int i = 0; i < WORKER_COUNT; ++i) workers.emplace_back(WorkerThreadMain);
 
+  ACCEL accels[2]{};
+  accels[0].fVirt = FCONTROL | FVIRTKEY;
+  accels[0].key = 'O';
+  accels[0].cmd = IDM_OPEN_FOLDER;
+  accels[1].fVirt = FCONTROL | FVIRTKEY;
+  accels[1].key = 'N';
+  accels[1].cmd = IDM_NEW_WINDOW_BLANK;
+  HACCEL hAccel = CreateAcceleratorTableW(accels, 2);
+
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0)) {
-    TranslateMessage(&msg);
-    DispatchMessageW(&msg);
+    if (!TranslateAcceleratorW(g_hwndMain, hAccel, &msg)) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
   }
+  if (hAccel) DestroyAcceleratorTable(hAccel);
 
   g_quit.store(true);
   g_jobCv.notify_all();
