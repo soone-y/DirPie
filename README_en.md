@@ -1,38 +1,34 @@
 # DirPie (Directory Pie)
 
 DirPie is a **directory size visualization tool** for the Windows environment.
-It visualizes the relationship between folder hierarchy and disk usage as a pie chart,
-with the primary goal of allowing users to see **which parts consume disk space at a glance**.
+It displays the relationship between folder hierarchy and disk usage as a pie chart,
+with the goal of allowing users to **see where disk space is being consumed at a glance**.
 
-This tool is intended for users who want to analyze disk usage or understand storage consumption in development environments.
-
-In short, it helps with storage organization.
-
-> For information about distributing the executable file (`.exe`), see `licence.md`.
+It is primarily intended for disk cleanup and understanding storage usage in development environments.
 
 ---
 
 ## What You Can Understand
 
-By using DirPie, you can intuitively grasp the following:
+By using DirPie, you can intuitively grasp:
 
 * Which folders consume large amounts of storage
 * At which directory levels storage imbalance occurs
 * The relative size of child directories compared to their parent directory
 * Areas that may be candidates for deletion or cleanup
 
-This tool is designed to visually capture **ratios and structure**, which are difficult to understand from numerical lists alone.
+This tool is designed to visualize **ratios and structure**, which are difficult to understand from numerical lists alone.
 
 ---
 
-## How to Use (Conceptual Flow)
+## Usage Concept
 
 1. Select a target directory
 2. Check the storage distribution using the pie chart
-3. Follow a sector (slice) of interest to navigate into a subdirectory
+3. Follow a sector (slice) of interest to navigate into subdirectories
 4. Return to the parent directory as needed
 
-The interaction model is closer to **exploration** than to traditional file management.
+The interaction model is closer to **exploration**.
 DirPie is intended to be used as a **storage structure viewer**, not as a file manager.
 
 ---
@@ -52,7 +48,62 @@ DirPie is intended to be used as a **storage structure viewer**, not as a file m
 
   * Used only to improve visual distinction (no semantic meaning)
 
-This design prioritizes **trend recognition** rather than precise numerical accuracy.
+Note: The design prioritizes **trend recognition** over precise numerical accuracy.
+
+---
+
+## Download / How to Run
+
+### Using the Prebuilt Executable (Recommended)
+
+The distributable executable is available via **GitHub Releases**.
+
+* Download `DirPie.exe` from the Releases page
+* Supported OS: Windows 10 / 11 (x64)
+* This software **does not read file contents, modify files, or delete anything**
+  (only file size and path information are used)
+
+Note: The executable is not placed in the repository root.
+
+---
+
+### Building from Source
+
+* Source code: `src/DirPie4.cpp`
+* Build helper script: `scripts/build.ps1` (for PowerShell)
+
+This project is a native Windows application written in C++.
+It can be built using Visual Studio (MSVC) or MinGW-w64 with the Windows SDK.
+
+---
+
+## Directory Structure
+
+```text
+/
+├─ src/        Source code
+├─ scripts/    Build scripts
+├─ README.md
+├─ README_en.md
+└─ LICENSE.md
+```
+
+The distributable `.exe` file is provided **only** via GitHub Releases.
+
+---
+
+## File Verification (Optional)
+
+To verify that the distributed `DirPie.exe` has not been modified,
+the SHA-256 hash value is published.
+
+### Verification (PowerShell)
+
+```powershell
+Get-FileHash .\DirPie.exe -Algorithm SHA256
+```
+
+Make sure the `Hash` value matches the SHA-256 listed on the GitHub Releases page.
 
 ---
 
@@ -60,28 +111,30 @@ This design prioritizes **trend recognition** rather than precise numerical accu
 
 Internally, DirPie performs roughly the following steps:
 
-1. Directory traversal
-
-   * Recursively enumerates folders and files
-2. Size aggregation
-
-   * Calculates total size for each node (directory)
-3. Structure retention
-
-   * Stores the hierarchy as a tree structure
-4. Rendering conversion
-
-   * Converts size ratios into angles and renders them as a pie chart
-5. Interaction handling
-
-   * Switches the displayed node according to user input
+1. Directory traversal (recursive enumeration)
+2. Size aggregation (per directory)
+3. Hierarchy retention as a tree structure
+4. Conversion of size ratios into angles for rendering
+5. Switching the displayed node based on user interaction
 
 **DirPie does not read file contents.**
-Only file size and path information are retrieved.
 
-* No operations modify the file system (such as writing or deleting files)
+* No file system modifications (write/delete) are performed
 * No network communication is performed
 * No external services or cloud integrations are used
+
+---
+
+## Development Status and Policy
+
+* **Feature additions are currently frozen**
+* The main objectives are:
+
+  * Improving stability
+  * Internal cleanup
+  * Enhancing readability and maintainability
+
+No major specification changes or new features are planned.
 
 ---
 
@@ -89,31 +142,16 @@ Only file size and path information are retrieved.
 
 This project contains code that was **generated or assisted by AI tools (such as ChatGPT)**.
 
-* Design decisions, adjustments, and final judgments were made by a human developer
-
-Please use the software with this understanding.
-
----
-
-## Development Status and Policy
-
-* **Feature additions are currently frozen**
-* The main objectives at this stage are:
-
-  * Improving stability
-  * Internal cleanup
-  * Enhancing readability and maintainability
-* No major specification changes or new features are planned
+Design decisions, adjustments, and final judgments were made by a human developer.
 
 ---
 
 ## License
 
 For details on usage, modification, and redistribution,
-refer to **`licence.md`**.
+refer to **`LICENSE.md`**.
 
-This README provides only a summary;
-all legal terms are consolidated in `licence.md`.
+This README provides a summary only.
 
 ---
 
@@ -126,63 +164,5 @@ all legal terms are consolidated in `licence.md`.
 
 ## Author / Credits
 
-* Author: (to be added)
+* Author: soone-y (GitHub)
 * This is a personal project
-
----
-
-## Build Information
-
-This project is built as a **Windows native application**.
-It does not require external runtimes or scripting environments and assumes a native C++ build.
-
----
-
-### Requirements
-
-* OS: Windows 10 / 11
-* Architecture: x64
-* Language: C++
-* API: Windows API (Win32)
-
-The following development environments are assumed:
-
-* Visual Studio (MSVC)
-* Windows-compatible C++ compilers such as MinGW-w64
-
-> In all cases, the **Windows SDK** is required.
-
----
-
-### Build Philosophy
-
-* The goal is to produce a single executable file (`.exe`)
-* The project does not depend on special build systems such as CMake
-* Both IDE-based builds and direct command-line builds are assumed
-
-As long as you have an environment that can
-**compile C++ source files as a Windows application**, the project can be built.
-
----
-
-### Notes on Character Encoding and Settings
-
-* The codebase assumes Unicode (UTF-16)
-* Wide-character (`W`) versions of Windows API functions are used
-* Unicode must be enabled in the compiler settings
-
----
-
-### Dependencies
-
-* External libraries are generally not used
-* Only APIs and libraries included with Windows are relied upon
-
-No additional DLLs need to be bundled.
-
----
-
-### Additional Notes
-
-* Issues may arise due to differences in build environments
-* Environment-specific problems should be handled at the user's discretion
